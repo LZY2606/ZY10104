@@ -1,5 +1,6 @@
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.zip.ZipFile
 
 plugins {
     `java-library`
@@ -59,6 +60,9 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
+    // Network-contract stages run in a fixed order via the dedicated
+    // verify*Contract tasks below; keep them out of the default test task.
+    exclude("com/github/kpavlov/jreactive8583/contract/**")
     testLogging {
         events =
             setOf(
@@ -67,6 +71,154 @@ tasks.test {
                 TestLogEvent.FAILED,
             )
     }
+}
+
+val verifyDependenciesResolvable =
+    tasks.register("verifyDependenciesResolvable") {
+        group = "verification"
+        description =
+            "Fails fast when dependencies cannot be resolved " +
+            "(e.g. --offline with an empty cache) instead of silently passing."
+        doLast {
+            val runtimeArtifacts = configurations.runtimeClasspath.get().resolve()
+            val testRuntimeArtifacts = configurations.testRuntimeClasspath.get().resolve()
+            check(runtimeArtifacts.isNotEmpty()) { "runtimeClasspath resolved to zero artifacts" }
+            check(testRuntimeArtifacts.isNotEmpty()) { "testRuntimeClasspath resolved to zero artifacts" }
+            logger.lifecycle(
+                "Dependency gate: resolved {} runtime and {} test-runtime artifacts.",
+                runtimeArtifacts.size,
+                testRuntimeArtifacts.size,
+            )
+        }
+    }
+
+fun registerContractTestStage(
+    name: String,
+    stageDescription: String,
+    vararg includes: String,
+    configure: Test.() -> Unit = {},
+): TaskProvider<Test> =
+    tasks.register<Test>(name) {
+        group = "verification"
+        description = stageDescription
+        val testSourceSet = sourceSets.test.get()
+        testClassesDirs = testSourceSet.output.classesDirs
+        classpath = testSourceSet.runtimeClasspath
+        useJUnitPlatform()
+        // Deterministic, sequential execution: the resource audit snapshots
+        // thread and allocator state and must not observe other tests running in parallel.
+        systemProperty("junit.jupiter.execution.parallel.enabled", "false")
+        includes.forEach { include(it) }
+        testLogging {
+            events =
+                setOf(
+                    TestLogEvent.PASSED,
+                    TestLogEvent.SKIPPED,
+                    TestLogEvent.FAILED,
+                )
+        }
+        doLast {
+            val xmlDir = reports.junitXml.outputLocation.get().asFile
+            val executed = (xmlDir.listFiles() ?: emptyArray()).count { it.name.startsWith("TEST-") }
+            if (executed == 0) {
+                throw GradleException(
+                    "$name executed no tests; an empty verification stage must not count as success.",
+                )
+            }
+        }
+        configure()
+    }
+
+val verifyCodecContract =
+    registerContractTestStage(
+        "verifyCodecContract",
+        "Stage 1/5: codec and pipeline unit tests.",
+        "com/github/kpavlov/jreactive8583/netty/codec/*",
+        "com/github/kpavlov/jreactive8583/netty/pipeline/*",
+    )
+
+val verifyVirtualTimeContract =
+    registerContractTestStage(
+        "verifyVirtualTimeContract",
+        "Stage 2/5: virtual-time reconnect/idle tests and deterministic fault injection.",
+        "com/github/kpavlov/jreactive8583/contract/VirtualTime*",
+        "com/github/kpavlov/jreactive8583/contract/FaultInjection*",
+    )
+
+val verifyLoopbackContract =
+    registerContractTestStage(
+        "verifyLoopbackContract",
+        "Stage 3/5: real loopback integration tests on dynamically bound ports.",
+        "com/github/kpavlov/jreactive8583/contract/Loopback*",
+    )
+
+val verifyResourceLeakContract =
+    registerContractTestStage(
+        "verifyResourceLeakContract",
+        "Stage 4/5: repeated rounds asserting no thread, listener or allocator growth.",
+        "com/github/kpavlov/jreactive8583/contract/ResourceLeak*",
+    ) {
+        systemProperty("io.netty.leakDetection.level", "PARANOID")
+    }
+
+verifyCodecContract.configure { dependsOn(verifyDependenciesResolvable) }
+verifyVirtualTimeContract.configure { dependsOn(verifyCodecContract) }
+verifyLoopbackContract.configure { dependsOn(verifyVirtualTimeContract) }
+verifyResourceLeakContract.configure { dependsOn(verifyLoopbackContract) }
+
+val verifyJarContract =
+    tasks.register("verifyJarContract") {
+        group = "verification"
+        description = "Stage 5/5: validates jar contents (classes, metadata, license, version, no test artifacts)."
+        dependsOn(verifyResourceLeakContract, tasks.jar)
+        doLast {
+            val jarFile = tasks.jar.get().archiveFile.get().asFile
+            val problems = mutableListOf<String>()
+            ZipFile(jarFile).use { zip ->
+                val names = zip.entries().asSequence().map { it.name }.toList()
+
+                if (names.none { it.startsWith("com/github/kpavlov/jreactive8583/") && it.endsWith(".class") }) {
+                    problems += "no compiled Kotlin/Java classes found"
+                }
+                if (names.none { it.startsWith("META-INF/") && it.endsWith(".kotlin_module") }) {
+                    problems += "Kotlin module metadata (META-INF/*.kotlin_module) is missing"
+                }
+                if ("com/github/kpavlov/jreactive8583/iso8583fields.properties" !in names) {
+                    problems += "service metadata resource iso8583fields.properties is missing"
+                }
+                if ("META-INF/LICENSE" !in names) {
+                    problems += "META-INF/LICENSE is missing"
+                }
+                val manifestEntry = zip.getEntry("META-INF/MANIFEST.MF")
+                val manifest = manifestEntry?.let { zip.getInputStream(it).readBytes().toString(Charsets.UTF_8) }.orEmpty()
+                if (!manifest.contains("Implementation-Version: ${project.version}")) {
+                    problems += "MANIFEST.MF does not declare Implementation-Version: ${project.version}"
+                }
+                val forbidden =
+                    names.filter {
+                        it.substringAfterLast('.').lowercase() in
+                            setOf("jks", "p12", "pfx", "pem", "crt", "cer", "der", "key", "log", "tmp", "bak")
+                    }
+                if (forbidden.isNotEmpty()) {
+                    problems += "test certificates or temporary logs found in jar: $forbidden"
+                }
+            }
+            if (problems.isNotEmpty()) {
+                throw GradleException(
+                    "Jar contract violated for ${jarFile.name}:\n - " + problems.joinToString("\n - "),
+                )
+            }
+            logger.lifecycle("Jar contract verified for {}", jarFile.name)
+        }
+    }
+
+tasks.register("verifyNetworkContract") {
+    group = "verification"
+    description =
+        "Runs the network contract gate in a fixed order: " +
+        "codec unit tests, virtual-time reconnect/idle tests, loopback integration tests, " +
+        "resource leak checks and jar content verification."
+    dependsOn(verifyJarContract)
 }
 
 val dokkaJavadocJar by tasks.registering(Jar::class) {
@@ -84,6 +236,9 @@ tasks.assemble {
 }
 
 tasks.jar {
+    from("LICENSE") {
+        into("META-INF")
+    }
     manifest {
         attributes(
             "Implementation-Title" to project.name,

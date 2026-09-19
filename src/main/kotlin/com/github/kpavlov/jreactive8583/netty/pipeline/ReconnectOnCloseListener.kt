@@ -36,7 +36,15 @@ public open class ReconnectOnCloseListener(
         if (!disconnectRequested.get()) {
             logger.trace("Failed to connect. Will try again in {} millis", reconnectInterval)
             executorService.schedule(
-                Callable { client.connectAsync() },
+                Callable {
+                    // Re-check at fire time: a disconnect may have been requested
+                    // while this reconnect was already scheduled (stop/reconnect race).
+                    if (!disconnectRequested.get()) {
+                        client.connectAsync()
+                    } else {
+                        logger.trace("Skipping scheduled reconnect: disconnect was requested")
+                    }
+                },
                 reconnectInterval.toLong(),
                 TimeUnit.MILLISECONDS,
             )

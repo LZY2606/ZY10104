@@ -179,6 +179,45 @@ and
 For frequently asked questions check the [FAQ](https://github.com/kpavlov/jreactive-8583/wiki/FAQ)
 page.
 
+## Network Contract Verification
+
+`./gradlew verifyNetworkContract` runs the network contract gate. The stages always run
+in a fixed order, and a failed stage stops the gate:
+
+1. `verifyDependenciesResolvable` - fails fast when dependencies cannot be resolved
+   (e.g. `--offline` with an empty cache) instead of silently passing.
+2. `verifyCodecContract` - codec and pipeline unit tests.
+3. `verifyVirtualTimeContract` - reconnect and idle tests on a virtual clock, plus
+   deterministic fault injection (fragmented length prefixes, coalesced frames,
+   half-frame close, write failures, stop/reconnect race). The same seed always
+   produces the same event timeline.
+4. `verifyLoopbackContract` - real loopback integration tests. Servers bind to an
+   ephemeral port and the address is read back from the actual channel; all waits
+   are futures/latches with explicit timeouts, never fixed sleeps.
+5. `verifyResourceLeakContract` - repeated rounds (20x) asserting that event loops,
+   scheduled reconnects, channels and allocator references are released after every
+   round, with no listener or thread growth. Survivors are reported with their owner.
+6. `verifyJarContract` - the jar must contain compiled classes, Kotlin module and
+   service metadata, the license and the version in the manifest, and no test
+   certificates or temporary logs.
+
+Local run:
+
+```bash
+./gradlew verifyNetworkContract
+```
+
+CI run (see `.github/workflows/network-contract.yml`):
+
+```bash
+./gradlew verifyNetworkContract --stacktrace
+```
+
+Offline mode is supported but strict: `./gradlew verifyNetworkContract --offline`
+fails in the first stage when the dependency cache is incomplete - missing
+dependencies never count as a pass. Stages are incremental; use `--rerun-tasks`
+to force a fresh full run.
+
 ## Sequence Diagram
 
 Message processing is described in the following diagram:
