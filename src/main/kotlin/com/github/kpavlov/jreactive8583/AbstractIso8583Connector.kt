@@ -59,8 +59,12 @@ public abstract class AbstractIso8583Connector<
         }
 
         public open fun shutdown() {
-            workerEventLoopGroup.shutdownGracefully()
-            bossEventLoopGroup.shutdownGracefully()
+            if (::workerEventLoopGroup.isInitialized) {
+                workerEventLoopGroup.shutdownGracefully()
+            }
+            if (::bossEventLoopGroup.isInitialized) {
+                bossEventLoopGroup.shutdownGracefully()
+            }
         }
 
         protected fun configureBootstrap(bootstrap: B) {
@@ -79,9 +83,9 @@ public abstract class AbstractIso8583Connector<
 
         protected abstract fun createBootstrap(): B
 
-        protected fun createBossEventLoopGroup(): EventLoopGroup = NioEventLoopGroup()
+        protected open fun createBossEventLoopGroup(): EventLoopGroup = NioEventLoopGroup()
 
-        protected fun createWorkerEventLoopGroup(): EventLoopGroup {
+        protected open fun createWorkerEventLoopGroup(): EventLoopGroup {
             val group = NioEventLoopGroup(configuration.workerThreadsCount)
             logger.debug(
                 "Created worker EventLoopGroup with {} executor threads",

@@ -138,6 +138,53 @@ server.shutdown();// [8]
 7. Verify that the server is started
 9. Shutdown server when you're done.
 
+## Building and Network Contract Verification
+
+Compile all main classes (used as the install/compile gate):
+
+    ./gradlew classes
+
+Run the full unit and integration test suite:
+
+    ./gradlew check
+
+Run the dedicated **network contract gate**, which verifies the network stack
+in a fixed order:
+
+    ./gradlew verifyNetworkContract
+
+The gate executes the following phases strictly one after another:
+
+1. `testCodecContract` &mdash; length-prefix codec unit tests: frame reassembly,
+   prefix fragmentation, sticky packets, half-frame-then-close and write failures.
+2. `testVirtualTimeContract` &mdash; reconnect scheduling and idle/heartbeat timing
+   on a virtual clock (deterministic scheduler / `EmbeddedChannel`), with no real
+   sockets or wall-clock sleeps; the same seed reproduces the same event timeline.
+3. `testLoopbackContract` &mdash; real NIO client/server integration over loopback.
+   The server binds an OS-assigned port (`0`) and the client connects to the address
+   read from the actually bound channel; connection and message delivery are awaited
+   on futures/latches with explicit timeouts (no pre-allocated "free port", no fixed
+   sleeps). It covers request/response exchange, remote connection refusal, and
+   reconnect after the server stops/restarts (stop/reconnect race).
+4. `testLeakContract` &mdash; repeats the connect/send/disconnect lifecycle twenty
+   times and asserts no growth in event-loop threads, accepted channels, allocator
+   buffer references or message listeners. Every case performs the same cleanup on
+   success or failure and reports ownership of any surviving resource.
+5. `verifyJarContents` &mdash; assembles the jar and asserts it contains compiled
+   classes, Kotlin module metadata, runtime service metadata, `META-INF/LICENSE` and
+   the implementation title/version, while containing no test certificates, test
+   libraries or temporary log files.
+
+The individual phases can also be run directly, e.g.
+`./gradlew testLoopbackContract`.
+
+### Offline builds
+
+The gate resolves its test dependencies up front. Running with `--offline`
+reuses already downloaded artifacts, but if a required dependency is missing from
+the local cache the build fails with `No cached version ... available for offline
+mode` &mdash; a missing dependency is never reported as a passing gate.
+
 ## Logging
 
 Default [`IsoMessageLoggingHandler`][IsoMessageLoggingHandler] may produce output like:

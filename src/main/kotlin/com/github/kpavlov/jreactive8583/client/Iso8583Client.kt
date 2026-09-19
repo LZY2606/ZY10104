@@ -15,6 +15,7 @@ import java.net.InetSocketAddress
 import java.net.SocketAddress
 import java.util.concurrent.TimeUnit
 
+@Suppress("TooManyFunctions")
 public open class Iso8583Client<T : IsoMessage>(
     private var socketAddress: SocketAddress,
     config: ClientConfiguration,
@@ -69,7 +70,7 @@ public open class Iso8583Client<T : IsoMessage>(
      * @return Returns the [ChannelFuture] which will be notified when this
      * channel is active.
      */
-    public fun connectAsync(): ChannelFuture {
+    public open fun connectAsync(): ChannelFuture {
         logger.debug("Connecting to {}", socketAddress)
         val b = bootstrap
         reconnectOnCloseListener.requestReconnect()
@@ -113,6 +114,15 @@ public open class Iso8583Client<T : IsoMessage>(
                 bossEventLoopGroup,
             )
         return b
+    }
+
+    public override fun shutdown() {
+        if (::reconnectOnCloseListener.isInitialized) {
+            // Cancel the intent to reconnect so an already-scheduled reconnect task
+            // becomes a no-op once the event loop groups are shut down.
+            reconnectOnCloseListener.requestDisconnect()
+        }
+        super.shutdown()
     }
 
     public fun disconnectAsync(): ChannelFuture? {
